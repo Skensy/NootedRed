@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
+#include <mach/mach.h>
 #include <utility>
 #include <vector>
 
@@ -359,14 +360,31 @@ static void testGuards() {
     printf("guards and DecodePicture branch checked\n");
 }
 
+static int unixCalls() {
+    task_events_info_data_t info{};
+    mach_msg_type_number_t count = TASK_EVENTS_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS) {
+        std::abort();
+    }
+    return info.syscalls_unix;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: harness blob.bin [clip.ivf width height expect]...\n");
+    if (argc < 3 || (argc - 3) % 4 != 0) {
+        fprintf(stderr, "usage: harness blob.bin trace [clip.ivf width height expect]...\n");
         return 2;
     }
     loadBlob(argv[1]);
+    const bool trace = std::strcmp(argv[2], "1") == 0;
+    *reinterpret_cast<uint8_t *>(BlobBase + TraceFlag) = trace;
+    alignas(8) uint8_t command[0x40]{};
+    const int before = unixCalls();
+    for (int i = 0; i < 128; ++i) { CHECK(fn<DecodeFn>(SymDecode)(nullptr, command, nullptr) == 5, "empty command"); }
+    const int calls = unixCalls() - before;
+    CHECK(calls == (trace ? 256 : 0), "trace %d: %d syscalls", trace, calls);
+    printf("trace %d: %d syscalls in 128 rejected frames\n", trace, calls);
     testGuards();
-    for (int i = 2; i + 3 < argc + 1 && i + 3 <= argc; i += 4) {
+    for (int i = 3; i < argc; i += 4) {
         testClip(argv[i], uint32_t(atoi(argv[i + 1])), uint32_t(atoi(argv[i + 2])), atoi(argv[i + 3]) != 0);
     }
     printf(failures ? "FAIL (%d)\n" : "PASS\n", failures);

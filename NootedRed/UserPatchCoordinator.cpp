@@ -11,6 +11,7 @@
 #include <VPF/DisplayDependencyPlanner.hpp>
 #include <kern/task.h>
 #include <mach/vm_map.h>
+#include <sys/errno.h>
 #include <sys/proc.h>
 
 namespace

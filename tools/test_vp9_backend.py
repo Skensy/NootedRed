@@ -59,7 +59,7 @@ def main():
     off = lambda n: defined[n] - BLOB_BASE
     (WORK / "vp9-backend-symbols.h").write_text(
         f"constexpr uintptr_t BlobBase = {BLOB_BASE:#x};\nconstexpr size_t BlobSize = {BLOB_SIZE:#x}, "
-        f"TableOffset = {TABLE:#x}, StateSize = {state_size};\n"
+        f"TraceFlag = {off('_vp9TraceEnabled'):#x}, TableOffset = {TABLE:#x}, StateSize = {state_size};\n"
         f"constexpr size_t SymCreate = {off('_vp9ProcessCreateDecodeSession'):#x}, "
         f"SymDpb = {off('_vp9CalculateDPBSize'):#x}, SymContext = {off('_vp9CalculateContextSize'):#x}, "
         f"SymInit = {off('_vp9InitHWContext'):#x}, SymArea = {off('_vp9GetDecodeTargetArea'):#x}, "
@@ -75,8 +75,9 @@ def main():
         ivf = v2.make_clip(name, size, frames, options, pix_fmt)
         width, height = size.split("x")
         args += [str(ivf), width, height, "0" if pix_fmt.endswith("10le") else "1"]
-    result = subprocess.run(args, timeout=300)
-    return result.returncode
+    for mode in ("0", "1"):
+        subprocess.run(args[:2] + [mode] + args[2:], check=True, timeout=300)
+    return 0
 
 
 if __name__ == "__main__":

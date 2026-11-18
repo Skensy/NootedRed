@@ -24,14 +24,21 @@ namespace UserVP9DecodeResolver
         UserCacheResolver::ImageBounds images[ImageCount]{};
     };
 
-    // uuid: i 16 byte dell'header della cache (offset 88). Il backend è verificato solo su questa cache.
-    inline bool resolve(UserSharedCache::Input& input, UInt64 base, const UInt8* uuid, Plan& plan)
+    enum class Resolution { Ready, Retry, Rejected };
+
+    inline Resolution resolve(UserSharedCache::Input& input, UInt64 base, const UInt8* uuid, Plan& plan, bool trace)
     {
-        if (!uuid || memcmp(uuid, CacheUUID, sizeof(CacheUUID)) != 0) { return false; }
-        if (!UserCacheResolver::resolveImages(input, base, ResolverImages, plan.images)) { return false; }
-        return UserCacheResolver::resolveFunctions(input, base, ResolverImages, ResolverFunctions, Patches,
-                                                   ResolverLocations, plan.patches, &plan.original[0][0],
-                                                   &plan.patched[0][0], MaxPatchSize, plan.images, true,
-                                                   SectionTargets, SectionCount, nullptr, nullptr);
+        if (!uuid || memcmp(uuid, CacheUUID, sizeof(CacheUUID)) != 0) { return Resolution::Rejected; }
+        if (!UserCacheResolver::resolveImages(input, base, ResolverImages, plan.images)
+            || !UserCacheResolver::resolveFunctions(input, base, ResolverImages, ResolverFunctions, Patches,
+                                                    ResolverLocations, plan.patches, &plan.original[0][0],
+                                                    &plan.patched[0][0], MaxPatchSize, plan.images, true,
+                                                    SectionTargets, SectionCount, nullptr, nullptr))
+        {
+            return input.readError ? Resolution::Retry : Resolution::Rejected;
+        }
+        static_assert(TraceSite < PatchCount && TraceOffset < Patches[TraceSite].size);
+        plan.patched[TraceSite][TraceOffset] = trace ? 1 : 0;
+        return Resolution::Ready;
     }
 }    // namespace UserVP9DecodeResolver

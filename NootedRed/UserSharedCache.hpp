@@ -37,6 +37,7 @@ namespace UserSharedCache
         ContextReader         contextReader{nullptr};
         // 由单次事务的堆工作区提供，不保存任何进程的匹配结果。
         UInt8*                scanBuffer{nullptr};
+        bool readError{false};
         static constexpr UInt32 ScanSize = 4096;
         void selectImages(UInt64 base, const ImageReference* refs, UInt32 count)
         {
@@ -65,6 +66,7 @@ namespace UserSharedCache
             ++reads;
             bytes += size;
             if ((contextReader ? contextReader(readerContext, address, value, size) : reader(address, value, size)) != 0) {
+                readError = true;
                 failed = true;
                 return false;
             }
@@ -147,11 +149,15 @@ namespace UserSharedCache
     {
         UInt8 header[456];
         if (!pathName || pathSize == 0 || pathSize > 256 || !input.reader || base >= UserLimit - sizeof(header)
-            || (base & 4095) != 0 || input.reader(base, header, sizeof(header)) != 0
-            || memcmp(header, "dyld_v1 x86_64h", 16) != 0)
+            || (base & 4095) != 0)
         {
             return false;
         }
+        if (input.reader(base, header, sizeof(header)) != 0) {
+            input.readError = true;
+            return false;
+        }
+        if (memcmp(header, "dyld_v1 x86_64h", 16) != 0) { return false; }
         // Darwin 25 的现代 image table；所有元数据都必须落在主缓存的首个只读映射内。
         const auto mappingOffset = word(header + 16), mappingCount = word(header + 20);
         const auto unslid = wide(header + 224), size = wide(header + 232), maxSlide = wide(header + 240);

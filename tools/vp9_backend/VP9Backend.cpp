@@ -42,6 +42,9 @@ extern "C" void *memcpy(void *dst, const void *src, size_t size) {
 }
 inline void *operator new(size_t, void *where) noexcept { return where; }
 
+// The kext sets this byte in the resolved plan before installing the decoder.
+extern "C" __attribute__((section("__TEXT,__const"))) const volatile uint8_t vp9TraceEnabled = 1;
+
 namespace {
 
 //! Progress report for -NRedVP9Trace: shared_region_check_np with a tagged argument, which NootedRed's syscall hook
@@ -52,8 +55,10 @@ enum TraceCode : uint32_t {
     TraceBitstream, TraceMessage, TraceDecodeEntry, TraceDecodeResult, TraceDecoderResult
 };
 __attribute__((noinline)) void trace(uint32_t code, uint64_t value) {
+    if (!vp9TraceEnabled) { return; }
     uint64_t arg = (0x5639ULL << 48) | (static_cast<uint64_t>(code) << 40) | (value & 0xFFFFFFFFFFULL);
-    asm volatile("syscall" : "+D"(arg) : "a"(0x2000126) : "rcx", "rdx", "r11", "memory", "cc");
+    uint64_t call = 0x2000126;
+    asm volatile("syscall" : "+a"(call), "+D"(arg) : : "rcx", "rdx", "r11", "memory", "cc");
 }
 
 template<typename T>

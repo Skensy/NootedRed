@@ -16,6 +16,7 @@ CACHE = Path('/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld')
 
 SOURCE = r'''
 #include <cassert>
+#include <initializer_list>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -25,8 +26,12 @@ SOURCE = r'''
 #include <UserVP9DecodeResolver.hpp>
 struct Mapping {uint64_t start,end,offset,mask,add;const char* path;int fd=-1;};
 static Mapping mappings[]={MAPPINGS};
+using UserVP9DecodeResolver::Resolution;
 static bool overlay=false;
+static int failAfter=-1;
 static int reader(uint64_t address,void* bytes,size_t length){
+ if(failAfter==0)return 1;
+ if(failAfter>0)--failAfter;
  for(auto&m:mappings)if(m.start<=address&&address<m.end&&length<=m.end-address){
   if(m.fd<0)m.fd=open(m.path,O_RDONLY);if(m.fd<0)return 1;
   if(pread(m.fd,bytes,length,m.offset+address-m.start)!=ssize_t(length))return 1;
@@ -76,17 +81,31 @@ static void check(const char* label){
    if(referenceOnly)continue;
    assert(!UserCacheResolver::matches(input,address,fn,f,false,UserVP9DecodeData::Patches,UserVP9DecodeData::ResolverLocations,UserVP9DecodeResolver::PatchCount));
   }
-  assert(!UserVP9DecodeResolver::resolve(input,base,UserVP9DecodeData::CacheUUID,plan));
+  assert(UserVP9DecodeResolver::resolve(input,base,UserVP9DecodeData::CacheUUID,plan,true)==Resolution::Rejected);
   printf("PASS vp9 %s: %u functions match the patched variant, re-resolution refused\n",label,count);
   return;
  }
- assert(UserVP9DecodeResolver::resolve(input,base,UserVP9DecodeData::CacheUUID,plan));
+ for(int step:{0,1,10}){
+  UserSharedCache::Input failing{reader,{}};failing.scanBuffer=scan;failAfter=step;
+  assert(UserVP9DecodeResolver::resolve(failing,base,UserVP9DecodeData::CacheUUID,plan,false)==Resolution::Retry);
+ }
+ failAfter=-1;
+ assert(UserVP9DecodeResolver::resolve(input,base,UserVP9DecodeData::CacheUUID,plan,true)==Resolution::Ready);
  for(unsigned i=0;i<UserVP9DecodeResolver::PatchCount;i++){
   const auto&p=plan.patches[i];const auto&g=UserVP9DecodeData::Patches[i];
   assert(p.offset==g.offset&&p.size==g.size);
   assert(!memcmp(p.original,g.original,p.size)&&!memcmp(p.patched,g.patched,p.size));
   uint8_t bytes[512];assert(reader(base+p.offset,bytes,p.size)==0);
   assert(!memcmp(bytes,p.original,p.size));
+ }
+ UserSharedCache::Input quiet{reader,{}};quiet.scanBuffer=scan;
+ assert(UserVP9DecodeResolver::resolve(quiet,base,UserVP9DecodeData::CacheUUID,plan,false)==Resolution::Ready);
+ for(unsigned i=0;i<UserVP9DecodeResolver::PatchCount;i++){
+  const auto&p=plan.patches[i]; const auto&g=UserVP9DecodeData::Patches[i];
+  for(unsigned j=0;j<p.size;j++){
+   const bool flag=i==UserVP9DecodeData::TraceSite && j==UserVP9DecodeData::TraceOffset;
+   assert(p.patched[j]==(flag ? 0 : g.patched[j]));
+  }
  }
  printf("PASS vp9 %s: %u sites, reads=%u bytes=%u\n",label,UserVP9DecodeResolver::PatchCount,input.reads,input.bytes);
 }
@@ -96,7 +115,7 @@ int main(){
  uint8_t other[16];memcpy(other,UserVP9DecodeData::CacheUUID,16);other[15]^=1;
  static UserVP9DecodeResolver::Plan plan;uint8_t scan[UserSharedCache::Input::ScanSize];
  UserSharedCache::Input input{reader,{}};input.scanBuffer=scan;
- assert(!UserVP9DecodeResolver::resolve(input,UserSurfaceSyncData::CacheBase,other,plan));
+ assert(UserVP9DecodeResolver::resolve(input,UserSurfaceSyncData::CacheBase,other,plan,false)==Resolution::Rejected);
  printf("PASS foreign cache UUID refused\n");
 }
 '''

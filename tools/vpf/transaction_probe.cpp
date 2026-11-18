@@ -122,7 +122,7 @@ int main()
         Ops ops;
         ops.failWritable = true;
         auto result = run(ops, 0);
-        assert(result.status == VPF::TransactionStatus::ProtectionFailed && result.restoreOk);
+        assert(result.status == VPF::TransactionStatus::ProtectionFailed && result.recovered());
         assert(ops.writes == 0 && ops.restores == 1);
     }
     // 第二次写失败：反向回滚两次写。
@@ -149,9 +149,23 @@ int main()
         ops.failWriteAt     = 2;
         ops.failPrepareAt   = 1;    // 回滚第 2 项时失败
         auto result = run(ops, 1);
-        assert(result.status == VPF::TransactionStatus::WriteFailed && result.touched == 2 && !result.rollbackOk);
+        assert(result.status == VPF::TransactionStatus::WriteFailed && result.touched == 2 && !result.recovered());
         assert(std::memcmp(ops.memory.data() + 0x10, patched[0], sizeof(patched[0])) == 0);
         assert(std::memcmp(ops.memory.data() + 0x200, original[1], sizeof(original[1])) == 0);
+    }
+    {
+        Ops ops;
+        ops.failRead = true;
+        ops.failPrepareAt = 1;
+        const auto result = run(ops, 0);
+        assert(result.status == VPF::TransactionStatus::ReadbackFailed && !result.recovered());
+    }
+    {
+        Ops ops;
+        ops.failWritable = true;
+        ops.failRestore = true;
+        const auto result = run(ops, 0);
+        assert(result.status == VPF::TransactionStatus::ProtectionFailed && !result.recovered());
     }
     // RX 恢复失败：回滚；回滚中的恢复也失败时报告 rollbackOk=false。
     {

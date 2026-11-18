@@ -569,6 +569,7 @@ namespace
             Failed
         };
         bool                           enabled{false};
+        bool                           traceEnabled{false};
         IOLock*                        lock{nullptr};
         State                          state{State::Off};
         UInt64                         resolvedBase{0};
@@ -600,20 +601,22 @@ namespace
             IOLockUnlock(lock);
 
             auto* scan = IONew(UInt8, UserSharedCache::Input::ScanSize);
-            bool  ok{false};
+            using UserVP9DecodeResolver::Resolution;
+            auto resolution = Resolution::Retry;
             if (scan) {
                 memset(plan, 0, sizeof(*plan));
                 UserSharedCache::Input input{readUser, {}};
                 input.scanBuffer = scan;
-                ok               = UserVP9DecodeResolver::resolve(input, base, uuid, *plan);
+                resolution = UserVP9DecodeResolver::resolve(input, base, uuid, *plan, traceEnabled);
                 IODelete(scan, UInt8, UserSharedCache::Input::ScanSize);
             }
             IOLockLock(lock);
-            // Senza memoria si riprova al prossimo processo; un mismatch invece è definitivo per questo avvio.
-            state        = ok ? State::Ready : (scan ? State::Rejected : State::Off);
+            const bool ok = resolution == Resolution::Ready;
+            const bool retry = resolution == Resolution::Retry;
+            state        = ok ? State::Ready : (retry ? State::Off : State::Rejected);
             resolvedBase = ok ? base : 0;
+            publishState(ok ? 2 : (retry ? 1 : 3));
             IOLockUnlock(lock);
-            publishState(ok ? 2 : 3);
             if (!ok) { SYSLOG("UserVideoDecode", "VP9: cache not verified, backend not installed"); }
             return ok;
         }
@@ -689,8 +692,7 @@ namespace
                 {
                     return;
                 }
-                const bool restored = committed.rollbackOk || committed.restoreOk;
-                if (!restored) { NRed::singleton().setProp32("NRedVP9Rollback", 1); }
+                if (!committed.recovered()) { NRed::singleton().setProp32("NRedVP9Rollback", 1); }
                 // Un errore di scrittura disattiva VP9 per il resto dell'avvio.
                 IOLockLock(lock);
                 state = State::Failed;
@@ -704,7 +706,6 @@ namespace
         }
 
         // Tracce del backend (-NRedVP9Trace): conteggio e ultimo valore per codice, solo dal processo decoder.
-        bool   traceEnabled{false};
         UInt32 traceCounts[32]{};
 
         bool trace(proc_t process, const UInt64 startAddress)

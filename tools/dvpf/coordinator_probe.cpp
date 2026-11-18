@@ -2,6 +2,7 @@
 #include <Headers/kern_patcher.hpp>
 #include <NRed.hpp>
 #include <UserPatchCoordinator.hpp>
+#include <UserVideoDecode.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -313,3 +314,4 @@ int main()
 // Fase 5, passo A: definita in HWLibs.cpp nel kext; il probe non ha PowerPlay.
 #include <VCNPowerTrace.hpp>
 void VCNPowerTrace::publishPending() {}
+bool UserVideoDecode::traceVP9(void*, UInt64 address) { return (address >> 48) == 0x5639; }

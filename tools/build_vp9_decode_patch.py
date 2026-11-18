@@ -122,7 +122,9 @@ def link(sections, syms, placement, externals):
                 raise ValueError("scattered relocation")
             symbolnum, pcrel, length, extern, kind = info & 0xFFFFFF, (info >> 24) & 1, (info >> 25) & 3, \
                 (info >> 27) & 1, info >> 28
-            if not pcrel or length != 2 or kind not in (1, 2):    # SIGNED, BRANCH
+            # SIGNED_1 uses the same formula: the extra immediate byte is included in the addend.
+            trace_ref = extern and kind == 6 and syms[symbolnum][0] == "_vp9TraceEnabled"
+            if not pcrel or length != 2 or (kind not in (1, 2) and not trace_ref):
                 raise ValueError(f"unsupported relocation kind {kind} in {s['name']}")
             field = new_base[i] + address
             addend = struct.unpack_from("<i", code, address)[0]
@@ -368,6 +370,13 @@ def main():
             header += f"    {{0x{address - cache.base:X}ULL, Original{i}, Patched{i}, sizeof(Original{i})}},\n"
             locations.append((function, offset))
         header += "};\n"
+        trace_offset = defined["_vp9TraceEnabled"] - start
+        trace_sites = [(i, trace_offset - off) for i, (fn, off, orig, _, _) in enumerate(records)
+                       if fn == region_index and off <= trace_offset < off + len(orig)]
+        if len(trace_sites) != 1 or patched[trace_offset] != 1 or any(f <= trace_offset < f + 4 for f in fields):
+            raise ValueError("trace flag must be a single verified data byte in the backend")
+        site, offset = trace_sites[0]
+        header += f"inline constexpr UInt32 TraceSite = {site}, TraceOffset = {offset};\n"
         header += resolver.header(locations)
         header += resolver.section_header()
         pages = len({(resolver.functions[f][1] + image_base + o) // 4096 for f, o, *_ in records})

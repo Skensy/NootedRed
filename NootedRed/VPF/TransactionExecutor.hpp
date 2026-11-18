@@ -56,6 +56,8 @@ namespace VPF
             UInt32            touched{0};
             bool              rollbackOk{false};
             bool              restoreOk{false};
+
+            bool recovered() const { return touched ? rollbackOk : restoreOk; }
         };
 
         SharedRegionTransaction(Ops& ops, const UInt64 base, const Patch* patches, const UInt32 count,

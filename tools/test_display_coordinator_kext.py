@@ -91,6 +91,10 @@ void* MODULEState(unsigned index){
 #include <NRed.hpp>
 #include <UserPatchCoordinator.hpp>
 
+#include <UserVideoDecode.hpp>
+#include <sys/errno.h>
+bool UserVideoDecode::traceVP9(void*, UInt64 address) { return (address >> 48) == 0x5639; }
+
 void registerDisplayModule(); void registerVideoModule();
 bool displayDefers(); bool videoDefers();
 unsigned displayTestGroups(); unsigned videoTestGroups();
@@ -198,6 +202,8 @@ int main(int argc,char** argv){
     init(patcher);
     assert(routeCalls==2);
     UInt64 args=0x1000;int value=0;
+    decltype(args) traceArgs{0x5639000000000000ULL};
+    assert(hook(current_task(),&traceArgs,&value)==EINVAL && !nativeCount && !coordinatedRuns());
     assert(hook(current_task(),&args,&value)==0 && value==123);
     assert(nativeCount==1 && nativeCalls()==1 && coordinatedRuns()==1);
     assert(displayCalls==1 && videoCalls==1 && registry().active==0 && registry().peak==1);
