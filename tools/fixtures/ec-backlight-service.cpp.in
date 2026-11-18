@@ -86,9 +86,37 @@ struct OSData : OSObject
         return start <= bytes.size() && count <= bytes.size() - start ? bytes.data() + start : nullptr;
     }
 };
+struct OSDictionary : OSObject
+{
+    std::map<std::string, OSObject*> entries;
+    void setObject(const char* key, OSObject* value)
+    {
+        value->retain();
+        auto& old = entries[key];
+        if (old) { old->release(); }
+        old = value;
+    }
+    OSDictionary* copyCollection() const
+    {
+        auto copy = new OSDictionary;
+        for (auto& [key, value] : entries) { copy->setObject(key.c_str(), value); }
+        return copy;
+    }
+    ~OSDictionary() { for (auto& entry : entries) { entry.second->release(); } }
+};
+struct IODisplay {};
 struct IOWorkLoop;
 struct IOService : OSObject
 {
+    OSDictionary* panels = nullptr;
+    OSObject* getProperty(const char*) { return panels; }
+    OSObject* copyProperty(const char*) { if (panels) { panels->retain(); } return panels; }
+    void setProperty(const char*, OSDictionary* value)
+    {
+        value->retain();
+        OSSafeReleaseNULL(panels);
+        panels = value;
+    }
     std::map<std::string, std::string> strings;
     std::map<std::string, UInt64>      numbers;
     virtual IOService*                 probe(IOService*, SInt32*) { return this; }
@@ -243,6 +271,15 @@ bool aux(void*, bool, unsigned level, unsigned)
     hardwareLevel = level;
     return writeOK;
 }
+bool originalSetDisplay(IOService* service, IODisplay*)
+{
+    auto* profile = service->panels->entries.at("F14Txxxx");
+    assert(service->panels->refs > 1);
+    OSSafeReleaseNULL(service->panels);
+    OSDictionary selected;
+    selected.setObject("profile", profile);
+    return false;
+}
 class Backlight
 {
 public:
@@ -253,6 +290,8 @@ public:
     decltype(&originalGet) orgGetAttributeForConnection   = originalGet;
     decltype(&pwm)         orgDcLinkSetBacklightLevel     = pwm;
     decltype(&aux)         orgDcLinkSetBacklightLevelNits = aux;
+    decltype(&originalSetDisplay) orgApplePanelSetDisplay = originalSetDisplay;
+    static bool wrapApplePanelSetDisplay(IOService*, IODisplay*);
     static Backlight&      singleton()
     {
         static Backlight b;
@@ -263,9 +302,19 @@ public:
 };
 SET_CALLBACK
 GET_CALLBACK
+PANEL_CALLBACK
 
 int main()
 {
+    {
+        unsigned before = live;
+        {
+            IOService panel;
+            panel.panels = new OSDictionary;
+            assert(!Backlight::wrapApplePanelSetDisplay(&panel, nullptr));
+        }
+        assert(live == before);
+    }
     IOACPIPlatformDevice device;
     SInt32               score = 0;
     assert(!NRedECBacklight::hasBackend());

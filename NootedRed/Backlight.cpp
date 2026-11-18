@@ -310,5 +310,9 @@ bool Backlight::wrapApplePanelSetDisplay(IOService* self, IODisplay* display)
         }
     }
 
-    return FunctionCast(wrapApplePanelSetDisplay, singleton().orgApplePanelSetDisplay)(self, display);
+    // AppleBacklight removes ApplePanels before retaining the selected profile in ApplePanel.
+    auto profiles = self->copyProperty("ApplePanels");
+    const auto result = FunctionCast(wrapApplePanelSetDisplay, singleton().orgApplePanelSetDisplay)(self, display);
+    OSSafeReleaseNULL(profiles);
+    return result;
 }

@@ -29,6 +29,8 @@ def main():
     source = source.replace('SERVICE_SOURCE', without_includes((ROOT / 'NootedRed/ECBacklight.cpp').read_text()))
     source = source.replace('SET_CALLBACK', extract(backlight, 'IOReturn Backlight::wrapSetAttributeForConnection('))
     source = source.replace('GET_CALLBACK', extract(backlight, 'IOReturn Backlight::wrapGetAttributeForConnection('))
+    profiles = backlight[backlight.index('struct ApplePanelData'):backlight.index('size_t Backlight::returnZero')]
+    source = source.replace('PANEL_CALLBACK', profiles + extract(backlight, 'bool Backlight::wrapApplePanelSetDisplay('))
     with tempfile.TemporaryDirectory(prefix='nred-ec-service-') as work:
         cpp, exe = Path(work) / 'test.cpp', Path(work) / 'test'
         cpp.write_text(source)
