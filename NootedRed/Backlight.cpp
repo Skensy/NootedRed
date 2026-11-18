@@ -183,30 +183,21 @@ IOReturn Backlight::wrapSetAttributeForConnection(IOService* const framebuffer, 
         framebuffer, connectIndex, attribute, value);
     if (attribute != kIOAppleBacklightAttribute) { return ret; }
 
-    const auto current = static_cast<UInt32>(value);
-    __atomic_store_n(&singleton().curBacklightLvl, current, __ATOMIC_RELEASE);
+    auto& panel = singleton();
+    if (panel.embeddedPanelLink == nullptr) { return kIOReturnNoDevice; }
 
-    if (singleton().embeddedPanelLink == nullptr) { return kIOReturnNoDevice; }
-
-    const auto maximum = __atomic_load_n(&singleton().maxBacklightLvl, __ATOMIC_ACQUIRE);
+    const auto maximum = __atomic_load_n(&panel.maxBacklightLvl, __ATOMIC_ACQUIRE);
     if (maximum == 0) { return kIOReturnInternalError; }
+    if (value > maximum) { return kIOReturnBadArgument; }
 
-    const auto percentage = current * 100 / maximum;
+    const auto scale = panel.supportsAUX ? panel.maxBacklightMillinits : 0xFFFFU;
+    const auto level = static_cast<UInt32>(static_cast<UInt64>(value) * scale / maximum);
+    const bool applied = panel.supportsAUX ? panel.orgDcLinkSetBacklightLevelNits(panel.embeddedPanelLink, true, level, 50)
+                                           : panel.orgDcLinkSetBacklightLevel(panel.embeddedPanelLink, level, 0);
+    if (!applied) { return kIOReturnDeviceError; }
 
-    if (singleton().supportsAUX) {
-        const auto auxValue = (singleton().maxBacklightMillinits * percentage) / 100;
-        if (singleton().orgDcLinkSetBacklightLevelNits(singleton().embeddedPanelLink, true, auxValue, 50)) {
-            return kIOReturnSuccess;
-        }
-    }
-    else {
-        const auto pwmValue = (percentage * 0xFFFF) / 100;
-        if (singleton().orgDcLinkSetBacklightLevel(singleton().embeddedPanelLink, pwmValue, 0)) {
-            return kIOReturnSuccess;
-        }
-    }
-
-    return kIOReturnDeviceError;
+    __atomic_store_n(&panel.curBacklightLvl, static_cast<UInt32>(value), __ATOMIC_RELEASE);
+    return kIOReturnSuccess;
 }
 
 IOReturn Backlight::wrapGetAttributeForConnection(IOService* framebuffer, IOIndex connectIndex, IOSelect attribute,
@@ -303,7 +294,7 @@ bool Backlight::wrapApplePanelSetDisplay(IOService* self, IODisplay* display)
                     auto pd = OSData::withBytes(entry.deviceData, sizeof(entry.deviceData));
                     if (pd) {
                         panels->setObject(entry.deviceName, pd);
-                        // No release required by current AppleBacklight implementation.
+                        pd->release();
                     }
                     else {
                         SYSLOG("Backlight", "setDisplay: Cannot allocate data for %s", entry.deviceName);

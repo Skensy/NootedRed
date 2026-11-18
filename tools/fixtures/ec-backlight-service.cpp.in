@@ -229,15 +229,19 @@ int originalGet(IOService*, IOIndex, IOSelect, uintptr_t* v)
     if (v) { *v = 777; }
     return -17;
 }
-bool pwm(void*, unsigned, unsigned)
+unsigned hardwareLevel = 0;
+bool writeOK = true;
+bool pwm(void*, unsigned level, unsigned)
 {
     ++pwmSets;
-    return true;
+    hardwareLevel = level;
+    return writeOK;
 }
-bool aux(void*, bool, unsigned, unsigned)
+bool aux(void*, bool, unsigned level, unsigned)
 {
     ++auxSets;
-    return true;
+    hardwareLevel = level;
+    return writeOK;
 }
 class Backlight
 {
@@ -354,6 +358,23 @@ int main()
     service.free();
     assert(device.refs == 1 && !NRedECBacklight::hasBackend());
     assert(Backlight::wrapSetAttributeForConnection(nullptr, 0, 1, 600) == 0 && nativeSets == 2 && pwmSets == 1);
+    auto& panel = Backlight::singleton();
+    panel.maxBacklightLvl = 65403;
+    for (bool useAux : {false, true}) {
+        panel.supportsAUX = useAux;
+        const UInt32 scale = useAux ? panel.maxBacklightMillinits : 0xFFFF;
+        for (UInt32 request : {0U, 1U, 654U, 65403U}) {
+            assert(panel.wrapSetAttributeForConnection(nullptr, 0, 1, request) == 0);
+            assert(hardwareLevel == static_cast<UInt64>(request) * scale / 65403);
+        }
+        writeOK = false;
+        assert(panel.wrapSetAttributeForConnection(nullptr, 0, 1, 730) == kIOReturnDeviceError);
+        assert(panel.wrapGetAttributeForConnection(nullptr, 0, 1, &level) == 0 && level == 65403);
+        writeOK = true;
+    }
+    panel.embeddedPanelLink = nullptr;
+    assert(panel.wrapSetAttributeForConnection(nullptr, 0, 1, 730) == kIOReturnNoDevice);
+    assert(panel.wrapGetAttributeForConnection(nullptr, 0, 1, &level) == 0 && level == 65403);
     // 启动失败或不支持的 WMI 设备均需释放全部资源。
     for (unsigned scenario = 0; scenario < 4; ++scenario) {
         failLoop        = scenario == 0;
