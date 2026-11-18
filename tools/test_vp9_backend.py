@@ -21,7 +21,7 @@ WORK = ROOT / "build/vp9/backend-test"
 BLOB_BASE, BLOB_SIZE, CODE, DATA, TRAMPOLINES, TABLE = 0x200000000, 0x4000, 0x100, 0x2000, 0x3000, 0x3800
 STUBS = ["_nrProcessVcnCreateDecodeSession", "_nrPrepareBitStream", "_nrGetSegFgBuffer", "_nrGetIOSurfaceBuffer",
          "_nrSetRefCon", "_nrDecodePictureEpilogue", "_nrGetAVDFuncSubId",
-         "_nrGetAVDFuncOutputFormatInfo", "_nrOutputFormatNV12"]
+         "_nrGetAVDFuncOutputFormatInfo", "_nrBufferRequirementNV12", "_nrBufferRequirementP010"]
 
 
 def main():
@@ -59,25 +59,27 @@ def main():
     off = lambda n: defined[n] - BLOB_BASE
     (WORK / "vp9-backend-symbols.h").write_text(
         f"constexpr uintptr_t BlobBase = {BLOB_BASE:#x};\nconstexpr size_t BlobSize = {BLOB_SIZE:#x}, "
-        f"TraceFlag = {off('_vp9TraceEnabled'):#x}, TableOffset = {TABLE:#x}, StateSize = {state_size};\n"
+        f"TableOffset = {TABLE:#x}, StateSize = {state_size};\n"
         f"constexpr size_t SymCreate = {off('_vp9ProcessCreateDecodeSession'):#x}, "
         f"SymDpb = {off('_vp9CalculateDPBSize'):#x}, SymContext = {off('_vp9CalculateContextSize'):#x}, "
         f"SymInit = {off('_vp9InitHWContext'):#x}, SymArea = {off('_vp9GetDecodeTargetArea'):#x}, "
         f"SymBitstream = {off('_vp9SetBitstreamFields'):#x}, SymMessage = {off('_vp9SetDecodeMessageFields'):#x}, "
-        f"SymDecode = {off('_vp9DecodePicture'):#x};\n")
+        f"SymDecode = {off('_vp9DecodePicture'):#x}, "
+        f"SymOutput = {off('_vp9GetAVDFuncOutputFormatInfo'):#x}, "
+        f"SymRequirement = {off('_vp9BufferRequirement'):#x};\n")
     del const
     exe = WORK / "harness"
     subprocess.run(["xcrun", "clang++", "-std=c++17", "-O1", "-g", f"-I{ROOT / 'NootedRed'}", f"-I{WORK}",
                     str(ROOT / "tools/fixtures/vp9-backend-harness.cpp"), "-o", str(exe)], check=True, timeout=120)
     v2.WORK.mkdir(parents=True, exist_ok=True)
     args = [str(exe), str(WORK / "blob.bin")]
-    for name, size, frames, options, pix_fmt, _ in v2.CLIPS:
+    unsupported = ("profile2-12bit", "320x180", 3, ["-b:v", "200k"], "yuv420p12le", False)
+    for name, size, frames, options, pix_fmt, _ in [*v2.CLIPS, unsupported]:
         ivf = v2.make_clip(name, size, frames, options, pix_fmt)
         width, height = size.split("x")
-        args += [str(ivf), width, height, "0" if pix_fmt.endswith("10le") else "1"]
-    for mode in ("0", "1"):
-        subprocess.run(args[:2] + [mode] + args[2:], check=True, timeout=300)
-    return 0
+        args += [str(ivf), width, height, {"yuv420p": "8", "yuv420p10le": "10", "yuv420p12le": "12"}[pix_fmt]]
+    result = subprocess.run(args, timeout=300)
+    return result.returncode
 
 
 if __name__ == "__main__":

@@ -29,7 +29,8 @@ def main():
     system = 'sonoma' if args.major == 23 else 'sequoia'
     namespace = 'UserSonomaSurfaceData' if args.major == 23 else 'UserSequoiaSurfaceData'
     WORK = ROOT / f'build/{system}/surface'
-    profile = json.loads((ROOT / f'tools/fixtures/{system}-compat.json').read_text())
+    profile_name = 'sonoma-compat.json' if args.major == 23 else 'sequoia-surface-15.8.3.json'
+    profile = json.loads((ROOT / 'tools/fixtures' / profile_name).read_text())
     WORK.mkdir(parents=True, exist_ok=True)
     cache = CacheReader(args.cache, profile['uuid'])
     try:
@@ -37,7 +38,7 @@ def main():
         for name, meta in profile['metal'].items():
             address, code = cache.function(name)
             if len(code) != meta['size'] or hashlib.sha256(code).hexdigest() != meta['sha256']:
-                raise ValueError(f'Sequoia 原生函数未核实：{name}')
+                raise ValueError(f'{system} 原生函数未核实：{name}')
             functions[name] = address, code
         resolver = ResolverData(cache, WORK)
         init, native = functions[INIT]
@@ -114,10 +115,13 @@ def main():
                    '    for (const auto& e : DevicePatches) { if (e.deviceID == deviceID) { return e.patches; } }\n'
                    '    return nullptr;\n}\n')
         header += resolver.header(locations)
+        header += resolver.section_header()
         submit, submit_code = functions[SUBMIT]
         submit_resolver = ResolverData(cache, WORK)
         submit_resolver.add(submit, submit_code, submit_code)
-        header += 'namespace Submit {\n' + submit_resolver.header([]) + '}\n}\n'
+        header += 'namespace Submit {\n' + submit_resolver.header([])
+        header += submit_resolver.section_header()
+        header += '}\n}\n'
         output = ROOT / f'NootedRed/{namespace}.hpp'
         if args.check:
             if output.read_text() != header:

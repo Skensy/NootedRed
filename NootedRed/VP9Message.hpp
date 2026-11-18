@@ -147,9 +147,12 @@ class Session {
     // Loop filter deltas and segmentation data persist until the bitstream changes them (Mesa's VA frontend).
     int8_t refDeltas[4] {1, 0, -1, -1}, modeDeltas[2] {};
     uint8_t absDelta {0}, treeProbs[7] {}, predProbs[3] {};
-    bool altQEnabled[8] {}, altLfEnabled[8] {}, refEnabled[8] {}, skipEnabled[8] {};
-    int16_t altQ[8] {}, altLf[8] {};
-    uint8_t refValue[8] {};
+    struct SegmentFeatures
+    {
+        bool    altQEnabled[8], altLfEnabled[8], refEnabled[8], skipEnabled[8];
+        int16_t altQ[8], altLf[8];
+        uint8_t refValue[8];
+    } features{};
     uint16_t slotWidth[8] {}, slotHeight[8] {};
     uint16_t prevWidth {0}, prevHeight {0};
     bool prevShowFrame {false};
@@ -157,7 +160,7 @@ class Session {
     Surface renderPicList[9] {};
 
     void colorConfig(BitReader &br, Header &h) {
-        h.bitDepth = bitDepth = static_cast<uint8_t>(h.profile >= 2 ? (br.u(1) ? 12 : 10) : 8);
+        h.bitDepth = static_cast<uint8_t>(h.profile >= 2 ? (br.u(1) ? 12 : 10) : 8);
         if (br.u(3) != 7) {    // color_space != CS_RGB
             br.u(1);           // color_range
             if (h.profile == 1 || h.profile == 3) { br.u(3); }
@@ -175,7 +178,7 @@ class Session {
         if (br.u(1)) { br.u(32); }
     }
 
-    Status parse(const uint8_t *data, size_t size, Header &h) {
+    Status parse(const uint8_t *data, size_t size, Header &h, uint8_t expectedBitDepth) {
         BitReader br(data, size);
         h = {};
         if (br.u(2) != 2) { return Status::Malformed; }
@@ -186,8 +189,7 @@ class Session {
         h.frameType = static_cast<uint8_t>(br.u(1));
         h.showFrame = static_cast<uint8_t>(br.u(1));
         h.errorResilient = static_cast<uint8_t>(br.u(1));
-        if (h.profile == 0) { bitDepth = 8; }
-        h.bitDepth = bitDepth;
+        h.bitDepth = h.profile == 0 ? 8 : bitDepth;
         if (h.frameType == 0) {
             if (br.u(24) != 0x498342) { return Status::Malformed; }
             colorConfig(br, h);
@@ -224,7 +226,9 @@ class Session {
                 h.interpFilter = br.u(1) ? 4 : literalToType[br.u(2)];
             }
         }
-        if (h.bitDepth > 10) { return Status::Unsupported; }
+        if (h.bitDepth != (h.profile == 2 ? 10 : 8) || (expectedBitDepth && h.bitDepth != expectedBitDepth)) {
+            return Status::Unsupported;
+        }
         if (!h.errorResilient) {
             h.refreshFrameContext = static_cast<uint8_t>(br.u(1));
             h.frameParallel = static_cast<uint8_t>(br.u(1));
@@ -238,6 +242,8 @@ class Session {
         if (h.frameType == 0 || h.intraOnly || h.errorResilient) {
             refDeltas[0] = 1, refDeltas[1] = 0, refDeltas[2] = -1, refDeltas[3] = -1;
             modeDeltas[0] = modeDeltas[1] = 0;
+            absDelta                      = 0;
+            features                      = {};
         }
         if ((h.modeRefDeltaEnabled = static_cast<uint8_t>(br.u(1))) &&
             (h.modeRefDeltaUpdate = static_cast<uint8_t>(br.u(1)))) {
@@ -263,10 +269,10 @@ class Session {
             if ((h.segUpdateData = static_cast<uint8_t>(br.u(1)))) {
                 absDelta = static_cast<uint8_t>(br.u(1));
                 for (int i = 0; i < 8; i++) {
-                    if ((altQEnabled[i] = br.u(1))) { altQ[i] = static_cast<int16_t>(br.s(8)); }
-                    if ((altLfEnabled[i] = br.u(1))) { altLf[i] = static_cast<int16_t>(br.s(6)); }
-                    if ((refEnabled[i] = br.u(1))) { refValue[i] = static_cast<uint8_t>(br.u(2)); }
-                    skipEnabled[i] = br.u(1);
+                    if ((features.altQEnabled[i] = br.u(1))) { features.altQ[i] = static_cast<int16_t>(br.s(8)); }
+                    if ((features.altLfEnabled[i] = br.u(1))) { features.altLf[i] = static_cast<int16_t>(br.s(6)); }
+                    if ((features.refEnabled[i] = br.u(1))) { features.refValue[i] = static_cast<uint8_t>(br.u(2)); }
+                    features.skipEnabled[i] = br.u(1);
                 }
             }
         }
@@ -282,7 +288,12 @@ class Session {
 
         h.compressedHeaderSize = static_cast<uint16_t>(br.u(16));
         h.uncompressedHeaderSize = static_cast<uint32_t>(br.bytesUsed());
-        if (br.overrun() || !h.width || !h.height) { return Status::Malformed; }
+        if (br.overrun() || !h.width || !h.height || !h.compressedHeaderSize
+            || h.compressedHeaderSize > size - h.uncompressedHeaderSize)
+        {
+            return Status::Malformed;
+        }
+        bitDepth = h.bitDepth;
         return Status::Ok;
     }
 
@@ -320,9 +331,9 @@ class Session {
     //! part keeps the last values when segmentation is off, as in Mesa. `p010` selects 10-bit output without
     //! dithering. Returns `Status::Ok` with `message` filled, or the reason the frame cannot go to the VCN.
     Status build(const uint8_t *frame, size_t size, Surface target, const Surface refs[8], bool p010,
-                 Message &message, ProbsSegment &probs, Header *headerOut = nullptr) {
+                 Message &message, ProbsSegment &probs, Header *headerOut = nullptr, uint8_t expectedBitDepth = 0) {
         Header h;
-        Status status = parse(frame, size, h);
+        Status status = parse(frame, size, h, expectedBitDepth);
         if (headerOut) { *headerOut = h; }
         if (status != Status::Ok) { return status; }
 
@@ -380,11 +391,11 @@ class Session {
         uint8_t featureMask[8] {};
         if (h.segEnabled) {
             for (int i = 0; i < 8; i++) {
-                featureData[i][0] = altQ[i];
-                featureData[i][1] = altLf[i];
-                featureData[i][2] = refValue[i];
-                featureMask[i] = static_cast<uint8_t>(altQEnabled[i] | altLfEnabled[i] << 1 | refEnabled[i] << 2 |
-                                                      skipEnabled[i] << 3);
+                featureData[i][0] = features.altQ[i];
+                featureData[i][1] = features.altLf[i];
+                featureData[i][2] = features.refValue[i];
+                featureMask[i]    = static_cast<uint8_t>(features.altQEnabled[i] | features.altLfEnabled[i] << 1
+                                                         | features.refEnabled[i] << 2 | features.skipEnabled[i] << 3);
             }
         }
         const int32_t scale = 1 << (h.filterLevel >> 5);

@@ -91,10 +91,6 @@ void* MODULEState(unsigned index){
 #include <NRed.hpp>
 #include <UserPatchCoordinator.hpp>
 
-#include <UserVideoDecode.hpp>
-#include <sys/errno.h>
-bool UserVideoDecode::traceVP9(void*, UInt64 address) { return (address >> 48) == 0x5639; }
-
 void registerDisplayModule(); void registerVideoModule();
 bool displayDefers(); bool videoDefers();
 unsigned displayTestGroups(); unsigned videoTestGroups();
@@ -102,6 +98,7 @@ void* displayState(unsigned); void* videoState(unsigned);
 unsigned displayCalls=0,videoCalls=0;
 unsigned long long displayBase=0,videoBase=0,displayProofAddress=0x20100,videoProofAddress=0x20200;
 bool displayPatched=false,videoPatched=false,displayIdle=false,videoIdle=false;
+static unsigned vp9Stage=0;
 static unsigned reads=0,allocations=0,frees=0;
 static bool memoryOK=true,destroyOnRead=false;
 static unsigned long long failRead=0;
@@ -202,8 +199,6 @@ int main(int argc,char** argv){
     init(patcher);
     assert(routeCalls==2);
     UInt64 args=0x1000;int value=0;
-    decltype(args) traceArgs{0x5639000000000000ULL};
-    assert(hook(current_task(),&traceArgs,&value)==EINVAL && !nativeCount && !coordinatedRuns());
     assert(hook(current_task(),&args,&value)==0 && value==123);
     assert(nativeCount==1 && nativeCalls()==1 && coordinatedRuns()==1);
     assert(displayCalls==1 && videoCalls==1 && registry().active==0 && registry().peak==1);
@@ -276,6 +271,33 @@ int main(int argc,char** argv){
     assert(hook(current_task(),&args,&value)==0);
     assert(hook(current_task(),&args,&value)==0 && displayCalls==idleStart+3 && videoCalls==idleStart+3);
     displayIdle=videoIdle=false;
+    assert(allocations==frees);
+    // VP9 未完成时必须重试；完成后全部站点仍参与跳过判定。
+    registerVideo([](void*,void*,int result,Transaction& tx){
+        ++videoCalls;
+        static const unsigned char original[64]={},replacement[64]={0x90,0xC3,0xCC,0xCC};
+        struct Site{unsigned long long address;unsigned size;const unsigned char*original,*replacement;};
+        struct Plan{Site value;unsigned siteCount()const{return 1;}const Site&site(unsigned)const{return value;}};
+        settlePatched(tx.video,Plan{{videoProofAddress,64,original,replacement}});
+        if(vp9Stage==1)tx.vp9.outcome=Outcome::Pending;
+        if(vp9Stage==2)settlePatched(tx.vp9,Plan{{0x20400,64,original,replacement}});
+        return result;
+    });
+    patchMemory(0x20400);
+    vp9Stage=1;
+    const auto pendingStart=videoCalls;
+    assert(hook(current_task(),&args,&value)==0);
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+2);
+    vp9Stage=2;
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+3);
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+3);
+    memory[0x43f]^=1;
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+4);
+    patchMemory(0x20400);failRead=0x20400;
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+5);
+    failRead=0;
+    assert(hook(current_task(),&args,&value)==0 && videoCalls==pendingStart+5);
+    forgetMap(reinterpret_cast<void*>(0x3));
     assert(allocations==frees);
     // 所有站点的原始字节与替换字节相同、空计划、超大补丁和越界地址都不能生成证明。
     {

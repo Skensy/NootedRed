@@ -4,15 +4,15 @@
 #include <NRed.hpp>
 #include <PenguinWizardry/KernelVersion.hpp>
 #include <UserPatchCoordinator.hpp>
-#include <UserPhaseTiming.hpp>
-#include <UserRejectedCaches.hpp>
 #include <UserPatchMapGate.hpp>
 #include <UserPatchMemory.hpp>
 #include <UserPatchPolicy.hpp>
+#include <UserPhaseTiming.hpp>
+#include <UserRejectedCaches.hpp>
+#include <UserVP9DecodeResolver.hpp>
 #include <UserVideoDecode.hpp>
 #include <UserVideoDecodeData.hpp>
 #include <UserVideoDecodeResolver.hpp>
-#include <UserVP9DecodeResolver.hpp>
 #include <VCN.hpp>
 #include <VCNCapabilities.hpp>
 #include <VPF/CapabilityState.hpp>
@@ -25,6 +25,7 @@
 #include <mach/i386/vm_param.h>
 #include <mach/vm_map.h>
 #include <mach/vm_region.h>
+#include <sys/errno.h>
 #include <sys/proc.h>
 
 namespace
@@ -158,17 +159,15 @@ namespace
     UInt32                            darwinMajor{0};
     const UserVideoDecodeData::Patch* devicePatches{nullptr};
     constexpr auto                    PatchCount   = arrsize(UserVideoDecodeData::Patches);
-    constexpr UInt32                  Capacity     = PatchCount;
+    constexpr UInt32                  Capacity     = PatchCount + UserVideoDecodeResolver::RDDPatchCount;
     constexpr UInt32                  MaxPageCount = Capacity * 2;
-    static_assert(PatchCount <= 32);
+    static_assert(Capacity <= VPF::MaxPlanSites);
     static_assert(arrsize(UserSequoiaVideoData::Patches) == PatchCount);
     static_assert(UserSequoiaVideoData::MaxPatchSize <= UserVideoDecodeData::MaxPatchSize);
 
     UInt32 fairPlayMask()
     {
-        return darwinMajor == 23 ? UserSonomaVideoData::FairPlayDecodeMask :
-               darwinMajor == 24 ? UserSequoiaVideoData::FairPlayDecodeMask :
-                                   UserVideoDecodeData::FairPlayDecodeMask;
+        return UserVideoDecodeResolver::fairPlayMask(darwinMajor);
     }
 
     enum class Stage : UInt32
@@ -301,6 +300,23 @@ namespace
             const auto& site = source.site(i);
             if (!out.addSite(site.address, site.offset, site.size, site.functionIndex, site.instructionOffset,
                              site.original, site.replacement))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool appendVTRDDCandidates(VPF::VerifiedPatchPlan& plan, UserSharedCache::Input& input, UInt64 base,
+                               UInt32 major, UserVideoDecodeResolver::RDDPlan& candidates, VPF::FastResolution& fast)
+    {
+        UserSharedCache::Input candidateInput{input.reader, input.cache};
+        candidateInput.scanBuffer = input.scanBuffer;
+        if (!UserVideoDecodeResolver::resolveRDD(candidateInput, base, candidates, major, &fast)) { return true; }
+        for (UInt32 i = 0; i < candidates.count; ++i) {
+            const auto& patch = candidates.patches[i];
+            if (!plan.addSite(base + patch.offset, patch.offset, patch.size, VPF::NoFunction, 0, patch.original,
+                              patch.patched))
             {
                 return false;
             }
@@ -473,6 +489,7 @@ namespace
         UserVideoDecodeData::Patch selected[PatchCount]{}, install[Capacity]{};
         VPF::VerifiedPatchPlan     decodePlan{}, installPlan{};
         VPF::PlannerResult         planner{};
+        UserVideoDecodeResolver::RDDPlan rdd{};
         Page                       pages[MaxPageCount]{};
         UserSharedCache::Input     input{nullptr, {}};
         UInt8                      scan[UserSharedCache::Input::ScanSize];
@@ -550,14 +567,13 @@ namespace
         return selectedCount != 0;
     }
 
-    // VP9 (piano V3, -NRedVP9): seconda transazione indipendente, solo dopo che la patch video è
-    // installata o già presente. La risoluzione completa si fa una volta per cache (sotto vp9Lock);
-    // ogni processo riverifica comunque tutti i byte dei siti prima di scrivere.
+    // VP9 在基础视频补丁就绪后单独安装。每个进程写入前重新核验全部站点。
     namespace VP9
     {
+
         using namespace UserVP9DecodeData;
-        constexpr UInt32 SiteCount = UserVP9DecodeResolver::PatchCount;
-        constexpr UInt32 MaxPages  = SiteCount * 2;
+        constexpr UInt32 MaxSites = UserVP9DecodeResolver::MaxSites;
+        constexpr UInt32 MaxPages = MaxSites * 2;
         static_assert(PageCount <= MaxPages);
 
         enum class State : UInt32
@@ -568,28 +584,51 @@ namespace
             Rejected,
             Failed
         };
-        bool                           enabled{false};
-        bool                           traceEnabled{false};
-        IOLock*                        lock{nullptr};
-        State                          state{State::Off};
-        UInt64                         resolvedBase{0};
-        UserVP9DecodeResolver::Plan*   plan{nullptr};
-        UInt32                         appliedCount{0}, alreadyCount{0};
+        IOLock*                      lock{nullptr};
+        State                        state{State::Off};
+        UInt64                       resolvedBase{0};
+        UInt8                        resolvedUUID[16]{};
+        UserVP9DecodeResolver::Plan* plan{nullptr};
+        UInt32                       appliedCount{0}, alreadyCount{0};
 
         void publishState(const UInt32 value) { NRed::singleton().setProp32("NRedVP9State", value); }
 
         struct Workspace
         {
-            SavedRow               saved[SiteCount];
-            UserPatchMemory::Page  pages[MaxPages];
+            struct Row
+            { UInt8 bytes[UserVP9DecodeData::MaxPatchSize]; } saved[MaxSites];
+            UserPatchMemory::Page pages[MaxPages];
         };
 
-        // Restituisce false se la cache non è quella verificata o la risoluzione è fallita.
+        struct ProofPlan
+        {
+            UInt64 base;
+            struct Site
+            {
+                UInt64       address;
+                UInt32       size;
+                const UInt8* original;
+                const UInt8* replacement;
+            };
+            UInt32 siteCount() const { return plan->count; }
+            Site   site(const UInt32 index) const
+            {
+                const auto& patch = plan->patches[index];
+                return {base + patch.offset, patch.size, patch.original, patch.patched};
+            }
+        };
+
+        void settle(UserPatchCoordinator::Participant* participant, const UInt64 base)
+        {
+            if (participant) { UserPatchCoordinator::settlePatched(*participant, ProofPlan{base}); }
+        }
+
+        // 同一启动内仅复用相同 UUID 和基址的已核验计划。
         bool resolved(const UInt64 base, const UInt8* uuid)
         {
             IOLockLock(lock);
             if (state == State::Ready) {
-                const bool same = resolvedBase == base;
+                const bool same = resolvedBase == base && memcmp(resolvedUUID, uuid, sizeof(resolvedUUID)) == 0;
                 IOLockUnlock(lock);
                 return same;
             }
@@ -601,42 +640,44 @@ namespace
             IOLockUnlock(lock);
 
             auto* scan = IONew(UInt8, UserSharedCache::Input::ScanSize);
-            using UserVP9DecodeResolver::Resolution;
-            auto resolution = Resolution::Retry;
+            bool  ok{false}, retry{true};
             if (scan) {
                 memset(plan, 0, sizeof(*plan));
                 UserSharedCache::Input input{readUser, {}};
                 input.scanBuffer = scan;
-                resolution = UserVP9DecodeResolver::resolve(input, base, uuid, *plan, traceEnabled);
+                ok               = UserVP9DecodeResolver::resolve(input, base, *plan, darwinMajor);
+                retry = input.readError;
                 IODelete(scan, UInt8, UserSharedCache::Input::ScanSize);
             }
             IOLockLock(lock);
-            const bool ok = resolution == Resolution::Ready;
-            const bool retry = resolution == Resolution::Retry;
             state        = ok ? State::Ready : (retry ? State::Off : State::Rejected);
             resolvedBase = ok ? base : 0;
+            if (ok) { memcpy(resolvedUUID, uuid, sizeof(resolvedUUID)); }
             publishState(ok ? 2 : (retry ? 1 : 3));
             IOLockUnlock(lock);
             if (!ok) { SYSLOG("UserVideoDecode", "VP9: cache not verified, backend not installed"); }
             return ok;
         }
 
-        void install(vm_map_t map, const UInt64 base, const UInt8* uuid)
+        void install(vm_map_t map, const UInt64 base, const UInt8* uuid, UserPatchCoordinator::Participant* participant)
         {
-            // Solo la cache su cui il backend è generato; le altre (es. DriverKit) non cambiano lo stato.
-            if (!enabled || !lock || darwinMajor != 25 || memcmp(uuid, CacheUUID, sizeof(CacheUUID)) != 0
-                || !resolved(base, uuid))
-            {
+            if (!lock || !plan) { return; }
+            if (participant) { participant->outcome = UserPatchCoordinator::Outcome::Pending; }
+            if (!resolved(base, uuid)) {
+                VCN::setVP9Ready(false);
                 return;
             }
             auto* work = IONew(Workspace, 1);
             if (!work) {
+                VCN::setVP9Ready(false);
                 error(KERN_RESOURCE_SHORTAGE);
                 return;
             }
+            memset(work, 0, sizeof(*work));
+            const auto siteCount = plan->count;
             UInt32 pageCount{0}, originals{0}, patched{0};
             bool   valid{true};
-            for (UInt32 i = 0; valid && i < SiteCount; ++i) {
+            for (UInt32 i = 0; valid && i < siteCount; ++i) {
                 const auto& site    = plan->patches[i];
                 const auto  address = base + site.offset;
                 if (site.size == 0 || site.size > MaxPatchSize || site.offset >= UserSharedCache::UserLimit - base
@@ -656,23 +697,28 @@ namespace
                     valid = false;
                 }
             }
-            if (!valid || (originals != SiteCount && patched != SiteCount)) {
+            if (!valid || (originals != siteCount && patched != siteCount)) {
                 // Stato misto o byte sconosciuti: non si tocca nulla.
                 NRed::singleton().setProp32("NRedVP9Mixed", 1);
+                VCN::setVP9Ready(false);
                 IODelete(work, Workspace, 1);
                 return;
             }
-            if (patched == SiteCount) {
+            if (patched == siteCount) {
                 bool executable{true};
                 for (UInt32 p = 0; executable && p < pageCount; ++p) {
                     executable = executablePage(map, work->pages[p].address);
                 }
                 if (executable) {
+                    settle(participant, base);
+                    VCN::setVP9Ready(true);
+                    NRed::singleton().setProp32("NRedVTDecoderAdmissionRevision", 1);
                     const auto count = __atomic_fetch_add(&alreadyCount, 1U, __ATOMIC_RELAXED);
                     if (count < 16) { NRed::singleton().setProp32("NRedVP9Already", count + 1); }
                 }
                 else {
                     NRed::singleton().setProp32("NRedVP9Region", 1);
+                    VCN::setVP9Ready(false);
                 }
                 IODelete(work, Workspace, 1);
                 return;
@@ -680,15 +726,18 @@ namespace
             ExecutorOps ops{map, queryRegion, error, readUser, writeUser};
             using Executor =
                 VPF::SharedRegionTransaction<ExecutorOps, UserVideoDecodeData::Patch, UserPatchMemory::Page, MaxPatchSize>;
-            Executor executor(ops, base, plan->patches, SiteCount,
+            Executor executor(ops, base, plan->patches, siteCount,
                               reinterpret_cast<UInt8(*)[MaxPatchSize]>(work->saved), work->pages, pageCount, 0);
             const auto committed = executor.commit([] { return true; });
             IODelete(work, Workspace, 1);
             if (committed.status != VPF::TransactionStatus::Installed) {
+                VCN::setVP9Ready(false);
                 NRed::singleton().setProp32("NRedVP9CommitStatus", static_cast<UInt32>(committed.status));
                 // Nessuna scrittura avvenuta: si riprova al prossimo processo.
                 if (committed.status == VPF::TransactionStatus::CheckFailed
-                    || committed.status == VPF::TransactionStatus::BeforeWriteFailed)
+                    || committed.status == VPF::TransactionStatus::BeforeWriteFailed
+                    || (committed.status == VPF::TransactionStatus::ProtectionFailed && committed.touched == 0
+                        && committed.restoreOk))
                 {
                     return;
                 }
@@ -702,31 +751,12 @@ namespace
                 return;
             }
             const auto count = __atomic_fetch_add(&appliedCount, 1U, __ATOMIC_RELAXED);
+            settle(participant, base);
+            VCN::setVP9Ready(true);
+            NRed::singleton().setProp32("NRedVTDecoderAdmissionRevision", 1);
             if (count < 16) { NRed::singleton().setProp32("NRedVP9Applied", count + 1); }
         }
 
-        // Tracce del backend (-NRedVP9Trace): conteggio e ultimo valore per codice, solo dal processo decoder.
-        UInt32 traceCounts[32]{};
-
-        bool trace(proc_t process, const UInt64 startAddress)
-        {
-            if ((startAddress >> 48) != 0x5639) { return false; }
-            if (!traceEnabled || !process) { return true; }
-            char name[32]{};
-            proc_name(proc_pid(process), name, sizeof(name));
-            name[sizeof(name) - 1] = '\0';
-            if (strncmp(name, "VTDecoderXPC", 12) != 0) { return true; }
-            const auto code  = static_cast<UInt32>((startAddress >> 40) & 0x1F);
-            const auto value = static_cast<UInt32>(startAddress & 0xFFFFFFFFULL);
-            const auto count = __atomic_add_fetch(&traceCounts[code], 1U, __ATOMIC_RELAXED);
-            char key[24];
-            snprintf(key, sizeof(key), "NRedVP9T%02uN", code);
-            NRed::singleton().setProp32(key, count);
-            snprintf(key, sizeof(key), "NRedVP9T%02uV", code);
-            NRed::singleton().setProp32(key, value);
-            if (count <= 2) { SYSLOG("UserVideoDecode", "VP9 trace %u = 0x%X (#%u)", code, value, count); }
-            return true;
-        }
     }    // namespace VP9
 
     __attribute__((noinline)) int patchSharedRegion(proc_t process, SharedRegionCheckArgs* args, const int result,
@@ -867,7 +897,9 @@ namespace
         auto& installPlan = workspace.installPlan;
         installPlan.reset(*decodeManifest, base, cache);
         if (!addPlanImages(installPlan, workspace.decodePlan)
-            || !appendPlanSites(installPlan, workspace.decodePlan) || installPlan.siteCount() == 0
+            || !appendPlanSites(installPlan, workspace.decodePlan)
+            || (!fairPlayDecode && !appendVTRDDCandidates(installPlan, input, base, major, workspace.rdd, fast))
+            || installPlan.siteCount() == 0
             || installPlan.siteCount() > Capacity || !installPlan.seal(VPF::PlanState::AllOriginal))
         {
             stage(Stage::CodeMismatch, fairPlayPID);
@@ -941,7 +973,9 @@ namespace
             observeLedger(mapKey);
             if (coordinated) { UserPatchCoordinator::settlePatched(coordinated->video, installPlan); }
             if (fairPlayDecode) { NRed::singleton().setProp32("NRedDRMVideoState", 3); }
-            else { VP9::install(map, base, &header[88]); }
+            else {
+                VP9::install(map, base, &header[88], coordinated ? &coordinated->vp9 : nullptr);
+            }
             return result;
         }
         if (planState != VPF::PlanState::AllOriginal) {
@@ -991,7 +1025,9 @@ namespace
         stage(Stage::Applied, fairPlayPID);
         if (coordinated) { UserPatchCoordinator::settlePatched(coordinated->video, installPlan); }
         if (fairPlayDecode) { NRed::singleton().setProp32("NRedDRMVideoState", 2); }
-        else { VP9::install(map, base, &header[88]); }
+        else {
+            VP9::install(map, base, &header[88], coordinated ? &coordinated->vp9 : nullptr);
+        }
         NRed::singleton().setProp32("NRedVCNUserDynamicApplied", 1);
         if (process != nullptr) {
             const auto pid = proc_pid(process);
@@ -1055,7 +1091,6 @@ namespace
     __attribute__((noinline)) int wrappedSharedRegionCheck(proc_t process, SharedRegionCheckArgs* args,
                                                            int* returnValue)
     {
-        if (args && VP9::trace(process, args->startAddress)) { return EINVAL; }
         auto ticket = __atomic_load_n(&hookTraceCount, __ATOMIC_RELAXED);
         bool trace{false};
         while (ticket < 8) {
@@ -1129,9 +1164,7 @@ void UserVideoDecode::init(KernelPatcher& patcher)
     rejectTrace            = checkKernelArgument("-NRedRejectTrace");
     NRed::singleton().setProp32("NRedVCNRejectedCacheTable", rejectedCaches.init() ? 1 : 0);
     darwinMajor            = currentKernelVersion().major();
-    const auto* candidates = darwinMajor == 23 ? UserSonomaVideoData::findDevice(deviceID) :
-                             darwinMajor == 24 ? UserSequoiaVideoData::findDevice(deviceID) :
-                                                 UserVideoDecodeData::findDevice(deviceID);
+    const auto* candidates = UserVideoDecodeResolver::findDevice(deviceID, darwinMajor);
     if (!candidates) {
         NRed::singleton().setProp32("NRedVCNUserRejected", 3);
         return;
@@ -1196,21 +1229,9 @@ void UserVideoDecode::init(KernelPatcher& patcher)
     }
     devicePatches = candidates;
     NRed::singleton().setProp32("NRedVCNUserEnabled", 1);
-    // VP9 (piano V3): disattivato salvo -NRedVP9; solo macOS 26 (cache verificata del backend).
-    VP9::enabled = false;
-    if (checkKernelArgument("-NRedVP9")) {
-        if (darwinMajor != 25) {
-            VP9::publishState(5);
-        }
-        else {
-            if (!VP9::lock) { VP9::lock = IOLockAlloc(); }
-            if (!VP9::plan) { VP9::plan = IONew(UserVP9DecodeResolver::Plan, 1); }
-            VP9::enabled = VP9::lock && VP9::plan;
-            VP9::traceEnabled = VP9::enabled && checkKernelArgument("-NRedVP9Trace");
-            if (VP9::traceEnabled) { NRed::singleton().setProp32("NRedVP9Trace", 1); }
-            VP9::publishState(VP9::enabled ? 1 : 6);
-        }
-    }
+    if (!VP9::lock) { VP9::lock = IOLockAlloc(); }
+    if (VP9::lock && !VP9::plan) { VP9::plan = IONew(UserVP9DecodeResolver::Plan, 1); }
+    VP9::publishState(VP9::plan ? 1 : 6);
     NRed::singleton().setProp32("NRedVCNUserMapGateRevision", 1);
     NRed::singleton().setProp32("NRedVCNRegionQueryVersion", 1);
     // FairPlay 诊断只在视频 Hook 安装成功后发布。
@@ -1224,9 +1245,4 @@ void UserVideoDecode::init(KernelPatcher& patcher)
             return patchSharedRegion(reinterpret_cast<proc_t>(process), reinterpret_cast<SharedRegionCheckArgs*>(args),
                                      result, &transaction);
         });
-}
-
-bool UserVideoDecode::traceVP9(void* process, const UInt64 startAddress)
-{
-    return VP9::trace(reinterpret_cast<proc_t>(process), startAddress);
 }
